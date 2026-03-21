@@ -1,0 +1,6 @@
+fastmcp>=2.3.0
+aioimaplib>=1.0.0
+aiosmtplib>=3.0.0
+pydantic>=2.7.0
+uvicorn[standard]>=0.32.0
+python-dotenv>=1.0.0
