@@ -181,20 +181,35 @@ class IMAPClient:
         if response.result != "OK":
             return None
 
-        raw_data = b""
+        # aioimaplib response structure:
+        # line[0]: bytes - metadata "N FETCH (UID X FLAGS (...) BODY[HEADER] {size})"
+        # line[1]: str/bytearray - actual header content
+        # line[2]: bytes - " BODY[TEXT] {size}"
+        # line[3]: str/bytearray - actual body content
+        # line[4]: bytes - ")"
+        # line[5]: bytes - "Fetch completed..."
         flags_str = ""
-        for line in response.lines:
-            if isinstance(line, bytes):
-                raw_data += line
-            elif isinstance(line, str):
-                if "FLAGS" in line:
-                    flags_str = line
+        header_data = b""
+        body_text_raw = ""
 
-        if not raw_data:
+        for i, line in enumerate(response.lines):
+            if isinstance(line, bytes):
+                decoded = line.decode("utf-8", errors="replace")
+                if "FLAGS" in decoded:
+                    flags_str = decoded
+            elif isinstance(line, (str, bytearray)):
+                # Content lines — first one is header, second is body
+                line_bytes = bytes(line, "utf-8") if isinstance(line, str) else bytes(line)
+                if not header_data:
+                    header_data = line_bytes
+                else:
+                    body_text_raw = line if isinstance(line, str) else line.decode("utf-8", errors="replace")
+
+        if not header_data:
             return None
 
         try:
-            msg = email.message_from_bytes(raw_data, policy=email.policy.default)
+            msg = email.message_from_bytes(header_data, policy=email.policy.default)
         except Exception:
             return None
 
@@ -203,28 +218,13 @@ class IMAPClient:
         sender = str(msg.get("From", ""))
         date_str = str(msg.get("Date", ""))
 
-        body = ""
-        try:
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        body = part.get_content()
-                        break
-            else:
-                if msg.get_content_type() == "text/plain":
-                    body = msg.get_content()
-        except Exception:
-            body = ""
+        # Preview from body text
+        preview = body_text_raw[:200].replace("\n", " ").replace("\r", " ").strip()
+        if len(body_text_raw) > 200:
+            preview += "..."
 
-        preview = (body[:200] + "...") if len(body) > 200 else body
-        preview = preview.replace("\n", " ").strip()
-
+        # Can't determine attachments from header-only fetch
         has_attachments = False
-        if msg.is_multipart():
-            has_attachments = any(
-                part.get_content_disposition() == "attachment"
-                for part in msg.walk()
-            )
 
         return EmailSummary(
             id=uid,
@@ -244,13 +244,19 @@ class IMAPClient:
         if response.result != "OK":
             return None
 
-        raw_data = b""
+        # Collect all content lines (str/bytearray) — these contain the full email
+        raw_parts = []
         for line in response.lines:
-            if isinstance(line, bytes):
-                raw_data += line
+            if isinstance(line, (str, bytearray)):
+                if isinstance(line, str):
+                    raw_parts.append(line.encode("utf-8"))
+                else:
+                    raw_parts.append(bytes(line))
 
-        if not raw_data:
+        if not raw_parts:
             return None
+
+        raw_data = b"\r\n".join(raw_parts)
 
         try:
             msg = email.message_from_bytes(raw_data, policy=email.policy.default)
