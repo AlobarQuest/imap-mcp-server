@@ -6,12 +6,11 @@ import email
 import email.policy
 import email.utils
 import logging
+import re
+import ssl
 from datetime import datetime
-from email.message import EmailMessage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
-import ssl
 
 import aioimaplib
 import aiosmtplib
@@ -31,7 +30,7 @@ IMAP_TIMEOUT = 30
 
 
 class IMAPClient:
-    """Async IMAP client wrapping aioimaplib."""
+    """Async IMAP client wrapping aioimaplib using UID commands."""
 
     def __init__(self, config: AccountConfig) -> None:
         self.config = config
@@ -46,7 +45,9 @@ class IMAPClient:
             ssl_context=ssl_context,
         )
         await self._imap.wait_hello_from_server()
-        await self._imap.login(self.config.username, self.config.password)
+        response = await self._imap.login(self.config.username, self.config.password)
+        if response.result != "OK":
+            raise Exception(f"Authentication failed for {self.config.username}")
 
     async def disconnect(self) -> None:
         if self._imap:
@@ -80,7 +81,7 @@ class IMAPClient:
         for line in response.lines:
             if not line:
                 continue
-            # Parse LIST response: (\\flags) "delimiter" "name"
+            # Parse LIST response: (\flags) "delimiter" "name"
             parts = line.rsplit('" ', 1)
             if len(parts) == 2:
                 folder_name = parts[1].strip('"')
@@ -115,7 +116,7 @@ class IMAPClient:
             criteria.append("ALL")
 
         search_str = " ".join(criteria)
-        response = await imap.search(search_str)
+        response = await imap.uid("search", search_str)
         if response.result != "OK":
             return []
 
@@ -130,15 +131,15 @@ class IMAPClient:
 
         results = []
         for uid in uids:
-            summary = await self._fetch_summary(imap, uid, folder)
+            summary = await self._fetch_summary(imap, uid)
             if summary:
                 results.append(summary)
         return results
 
     async def _fetch_summary(
-        self, imap: aioimaplib.IMAP4_SSL, uid: str, folder: str
+        self, imap: aioimaplib.IMAP4_SSL, uid: str
     ) -> EmailSummary | None:
-        response = await imap.fetch(uid, "(FLAGS BODY.PEEK[HEADER] BODY.PEEK[TEXT])")
+        response = await imap.uid("fetch", uid, "(FLAGS BODY.PEEK[HEADER] BODY.PEEK[TEXT])")
         if response.result != "OK":
             return None
 
@@ -150,6 +151,9 @@ class IMAPClient:
                 raw_data += line
             elif isinstance(line, str) and "FLAGS" in line:
                 flags_str = line
+
+        if not raw_data:
+            return None
 
         try:
             msg = email.message_from_bytes(raw_data, policy=email.policy.default)
@@ -163,22 +167,27 @@ class IMAPClient:
 
         # Get preview from body
         body = ""
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_type() == "text/plain":
-                    body = part.get_content()
-                    break
-        else:
-            body = msg.get_content() if msg.get_content_type() == "text/plain" else ""
+        try:
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = part.get_content()
+                        break
+            else:
+                if msg.get_content_type() == "text/plain":
+                    body = msg.get_content()
+        except Exception:
+            body = ""
 
         preview = (body[:200] + "...") if len(body) > 200 else body
         preview = preview.replace("\n", " ").strip()
 
-        has_attachments = any(
-            part.get_content_disposition() == "attachment"
-            for part in msg.walk()
-            if msg.is_multipart()
-        )
+        has_attachments = False
+        if msg.is_multipart():
+            has_attachments = any(
+                part.get_content_disposition() == "attachment"
+                for part in msg.walk()
+            )
 
         return EmailSummary(
             id=uid,
@@ -194,7 +203,7 @@ class IMAPClient:
         imap = await self._ensure_connected()
         await imap.select(folder)
 
-        response = await imap.fetch(uid, "(FLAGS BODY[])")
+        response = await imap.uid("fetch", uid, "(FLAGS BODY[])")
         if response.result != "OK":
             return None
 
@@ -202,6 +211,9 @@ class IMAPClient:
         for line in response.lines:
             if isinstance(line, bytes):
                 raw_data += line
+
+        if not raw_data:
+            return None
 
         try:
             msg = email.message_from_bytes(raw_data, policy=email.policy.default)
@@ -218,30 +230,38 @@ class IMAPClient:
         body_html = ""
         attachments: list[Attachment] = []
 
-        if msg.is_multipart():
-            for part in msg.walk():
-                content_type = part.get_content_type()
-                disposition = part.get_content_disposition()
+        try:
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    disposition = part.get_content_disposition()
 
-                if disposition == "attachment":
-                    attachments.append(
-                        Attachment(
-                            filename=part.get_filename() or "unnamed",
-                            size=len(part.get_content() if hasattr(part.get_content(), '__len__') else b""),
-                            content_type=content_type,
+                    if disposition == "attachment":
+                        try:
+                            content = part.get_content()
+                            size = len(content) if hasattr(content, '__len__') else 0
+                        except Exception:
+                            size = 0
+                        attachments.append(
+                            Attachment(
+                                filename=part.get_filename() or "unnamed",
+                                size=size,
+                                content_type=content_type,
+                            )
                         )
-                    )
-                elif content_type == "text/plain" and not body_text:
-                    body_text = part.get_content()
-                elif content_type == "text/html" and not body_html:
-                    body_html = part.get_content()
-        else:
-            content_type = msg.get_content_type()
-            content = msg.get_content()
-            if content_type == "text/plain":
-                body_text = content
-            elif content_type == "text/html":
-                body_html = content
+                    elif content_type == "text/plain" and not body_text:
+                        body_text = part.get_content()
+                    elif content_type == "text/html" and not body_html:
+                        body_html = part.get_content()
+            else:
+                content_type = msg.get_content_type()
+                content = msg.get_content()
+                if content_type == "text/plain":
+                    body_text = content
+                elif content_type == "text/html":
+                    body_html = content
+        except Exception:
+            pass
 
         return EmailDetail(
             id=uid,
@@ -275,7 +295,7 @@ class IMAPClient:
                     f'OR (OR SUBJECT "{query}" FROM "{query}") '
                     f'(OR TO "{query}" BODY "{query}")'
                 )
-                response = await imap.search(search_criteria)
+                response = await imap.uid("search", search_criteria)
                 if response.result != "OK":
                     continue
 
@@ -285,7 +305,7 @@ class IMAPClient:
                 uids = list(reversed(uid_line.split()))
 
                 for uid in uids[: limit - len(results)]:
-                    summary = await self._fetch_summary(imap, uid, f)
+                    summary = await self._fetch_summary(imap, uid)
                     if summary:
                         results.append(summary)
             except Exception:
@@ -306,7 +326,7 @@ class IMAPClient:
         count = 0
         for uid in uids:
             flag_op = "+FLAGS" if read else "-FLAGS"
-            response = await imap.store(uid, flag_op, "\\Seen")
+            response = await imap.uid("store", uid, flag_op, "(\\Seen)")
             if response.result == "OK":
                 count += 1
 
@@ -323,9 +343,9 @@ class IMAPClient:
 
         count = 0
         for uid in uids:
-            response = await imap.copy(uid, to_folder)
+            response = await imap.uid("copy", uid, to_folder)
             if response.result == "OK":
-                await imap.store(uid, "+FLAGS", "\\Deleted")
+                await imap.uid("store", uid, "+FLAGS", "(\\Deleted)")
                 count += 1
 
         if count > 0:
@@ -345,7 +365,7 @@ class IMAPClient:
         if permanent:
             count = 0
             for uid in uids:
-                response = await imap.store(uid, "+FLAGS", "\\Deleted")
+                response = await imap.uid("store", uid, "+FLAGS", "(\\Deleted)")
                 if response.result == "OK":
                     count += 1
             if count > 0:
@@ -397,7 +417,7 @@ class SMTPClient:
         if bcc:
             all_recipients.extend(bcc)
 
-        result = await aiosmtplib.send(
+        await aiosmtplib.send(
             msg,
             hostname=self.config.smtp_host,
             port=self.config.smtp_port,
@@ -407,6 +427,5 @@ class SMTPClient:
             recipients=all_recipients,
         )
 
-        # aiosmtplib.send returns a tuple of (response_dict, message_str)
         message_id = msg.get("Message-ID", "")
         return SendResult(success=True, message_id=message_id)
