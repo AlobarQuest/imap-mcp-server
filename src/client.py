@@ -89,6 +89,8 @@ class IMAPClient:
         for line in response.lines:
             if not line:
                 continue
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", errors="replace")
             parts = line.rsplit('" ', 1)
             if len(parts) == 2:
                 folder_name = parts[1].strip('"')
@@ -96,11 +98,14 @@ class IMAPClient:
         return folders
 
     async def _search(self, imap: aioimaplib.IMAP4_SSL, criteria: str) -> list[str]:
-        """Run SEARCH (not UID SEARCH) and return sequence numbers."""
+        """Run SEARCH (not UID SEARCH) and return sequence numbers as strings."""
         response = await imap.search(criteria)
         if response.result != "OK":
             return []
         line = response.lines[0]
+        # Handle bytes or str
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="replace")
         if not line.strip():
             return []
         return line.split()
@@ -109,13 +114,16 @@ class IMAPClient:
         """Convert sequence numbers to UIDs via FETCH."""
         if not seqs:
             return []
-        # Fetch UIDs for all sequence numbers in one call
-        seq_set = ",".join(seqs)
+        # Ensure all seqs are strings
+        seq_set = ",".join(str(s) for s in seqs)
         response = await imap.fetch(seq_set, "(UID)")
         if response.result != "OK":
             return []
         uids = []
         for line in response.lines:
+            # Handle both bytes and str
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", errors="replace")
             if isinstance(line, str):
                 m = UID_RE.search(line)
                 if m:
@@ -178,8 +186,9 @@ class IMAPClient:
         for line in response.lines:
             if isinstance(line, bytes):
                 raw_data += line
-            elif isinstance(line, str) and "FLAGS" in line:
-                flags_str = line
+            elif isinstance(line, str):
+                if "FLAGS" in line:
+                    flags_str = line
 
         if not raw_data:
             return None
