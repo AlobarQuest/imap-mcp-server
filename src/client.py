@@ -28,9 +28,17 @@ logger = logging.getLogger(__name__)
 
 IMAP_TIMEOUT = 30
 
+# Regex to extract UID from FETCH response line like "1 FETCH (UID 42 FLAGS ...)"
+UID_RE = re.compile(r"UID\s+(\d+)")
+
 
 class IMAPClient:
-    """Async IMAP client wrapping aioimaplib using UID commands."""
+    """Async IMAP client wrapping aioimaplib.
+
+    Uses regular SEARCH (not UID SEARCH) because some IMAP servers
+    (e.g. Namecheap Private Email) don't support UID SEARCH.
+    Uses UID FETCH/STORE/COPY for all other operations.
+    """
 
     def __init__(self, config: AccountConfig) -> None:
         self.config = config
@@ -81,12 +89,38 @@ class IMAPClient:
         for line in response.lines:
             if not line:
                 continue
-            # Parse LIST response: (\flags) "delimiter" "name"
             parts = line.rsplit('" ', 1)
             if len(parts) == 2:
                 folder_name = parts[1].strip('"')
                 folders.append(folder_name)
         return folders
+
+    async def _search(self, imap: aioimaplib.IMAP4_SSL, criteria: str) -> list[str]:
+        """Run SEARCH (not UID SEARCH) and return sequence numbers."""
+        response = await imap.search(criteria)
+        if response.result != "OK":
+            return []
+        line = response.lines[0]
+        if not line.strip():
+            return []
+        return line.split()
+
+    async def _seq_to_uids(self, imap: aioimaplib.IMAP4_SSL, seqs: list[str]) -> list[str]:
+        """Convert sequence numbers to UIDs via FETCH."""
+        if not seqs:
+            return []
+        # Fetch UIDs for all sequence numbers in one call
+        seq_set = ",".join(seqs)
+        response = await imap.fetch(seq_set, "(UID)")
+        if response.result != "OK":
+            return []
+        uids = []
+        for line in response.lines:
+            if isinstance(line, str):
+                m = UID_RE.search(line)
+                if m:
+                    uids.append(m.group(1))
+        return uids
 
     async def list_emails(
         self,
@@ -116,18 +150,14 @@ class IMAPClient:
             criteria.append("ALL")
 
         search_str = " ".join(criteria)
-        response = await imap.uid("search", search_str)
-        if response.result != "OK":
-            return []
-
-        uid_line = response.lines[0]
-        if not uid_line.strip():
-            return []
-        uids = uid_line.split()
+        seqs = await self._search(imap, search_str)
 
         # Reverse for newest first, apply pagination
-        uids = list(reversed(uids))
-        uids = uids[offset : offset + limit]
+        seqs = list(reversed(seqs))
+        seqs = seqs[offset : offset + limit]
+
+        # Convert to UIDs
+        uids = await self._seq_to_uids(imap, seqs)
 
         results = []
         for uid in uids:
@@ -143,7 +173,6 @@ class IMAPClient:
         if response.result != "OK":
             return None
 
-        # Parse the fetched data
         raw_data = b""
         flags_str = ""
         for line in response.lines:
@@ -165,7 +194,6 @@ class IMAPClient:
         sender = str(msg.get("From", ""))
         date_str = str(msg.get("Date", ""))
 
-        # Get preview from body
         body = ""
         try:
             if msg.is_multipart():
@@ -295,16 +323,11 @@ class IMAPClient:
                     f'OR (OR SUBJECT "{query}" FROM "{query}") '
                     f'(OR TO "{query}" BODY "{query}")'
                 )
-                response = await imap.uid("search", search_criteria)
-                if response.result != "OK":
-                    continue
+                seqs = await self._search(imap, search_criteria)
+                seqs = list(reversed(seqs))
+                uids = await self._seq_to_uids(imap, seqs[: limit - len(results)])
 
-                uid_line = response.lines[0]
-                if not uid_line.strip():
-                    continue
-                uids = list(reversed(uid_line.split()))
-
-                for uid in uids[: limit - len(results)]:
+                for uid in uids:
                     summary = await self._fetch_summary(imap, uid)
                     if summary:
                         results.append(summary)
