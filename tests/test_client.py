@@ -19,6 +19,22 @@ TEST_CONFIG = AccountConfig(
 )
 
 
+def _ok_resp():
+    r = MagicMock()
+    r.result = "OK"
+    return r
+
+
+def _mock_imap_connected():
+    """Return a mock IMAP with noop/select returning OK."""
+    mock = AsyncMock()
+    mock.noop.return_value = _ok_resp()
+    mock.select.return_value = _ok_resp()
+    mock.expunge.return_value = _ok_resp()
+    mock.uid.return_value = _ok_resp()
+    return mock
+
+
 class TestIMAPClient:
     def test_init(self):
         client = IMAPClient(TEST_CONFIG)
@@ -39,9 +55,7 @@ class TestIMAPClient:
     async def test_is_connected_noop_ok(self):
         client = IMAPClient(TEST_CONFIG)
         mock_imap = AsyncMock()
-        mock_response = MagicMock()
-        mock_response.result = "OK"
-        mock_imap.noop.return_value = mock_response
+        mock_imap.noop.return_value = _ok_resp()
         client._imap = mock_imap
         assert await client.is_connected() is True
 
@@ -56,14 +70,8 @@ class TestIMAPClient:
     @pytest.mark.asyncio
     async def test_list_folders(self):
         client = IMAPClient(TEST_CONFIG)
-        mock_imap = AsyncMock()
+        mock_imap = _mock_imap_connected()
 
-        # Mock noop for is_connected
-        noop_resp = MagicMock()
-        noop_resp.result = "OK"
-        mock_imap.noop.return_value = noop_resp
-
-        # Mock list response
         list_resp = MagicMock()
         list_resp.result = "OK"
         list_resp.lines = [
@@ -82,11 +90,7 @@ class TestIMAPClient:
     @pytest.mark.asyncio
     async def test_list_folders_failure(self):
         client = IMAPClient(TEST_CONFIG)
-        mock_imap = AsyncMock()
-
-        noop_resp = MagicMock()
-        noop_resp.result = "OK"
-        mock_imap.noop.return_value = noop_resp
+        mock_imap = _mock_imap_connected()
 
         list_resp = MagicMock()
         list_resp.result = "NO"
@@ -99,103 +103,43 @@ class TestIMAPClient:
     @pytest.mark.asyncio
     async def test_mark_read(self):
         client = IMAPClient(TEST_CONFIG)
-        mock_imap = AsyncMock()
-
-        noop_resp = MagicMock()
-        noop_resp.result = "OK"
-        mock_imap.noop.return_value = noop_resp
-
-        select_resp = MagicMock()
-        select_resp.result = "OK"
-        mock_imap.select.return_value = select_resp
-
-        store_resp = MagicMock()
-        store_resp.result = "OK"
-        mock_imap.store.return_value = store_resp
+        mock_imap = _mock_imap_connected()
         client._imap = mock_imap
 
         result = await client.mark_read(["1", "2"], folder="INBOX", read=True)
         assert result.success is True
         assert result.updated_count == 2
-        assert mock_imap.store.call_count == 2
+        # Should call uid("store", ...) for each UID
+        assert mock_imap.uid.call_count == 2
+        mock_imap.uid.assert_any_call("store", "1", "+FLAGS", "(\\Seen)")
+        mock_imap.uid.assert_any_call("store", "2", "+FLAGS", "(\\Seen)")
 
     @pytest.mark.asyncio
     async def test_mark_unread(self):
         client = IMAPClient(TEST_CONFIG)
-        mock_imap = AsyncMock()
-
-        noop_resp = MagicMock()
-        noop_resp.result = "OK"
-        mock_imap.noop.return_value = noop_resp
-
-        select_resp = MagicMock()
-        select_resp.result = "OK"
-        mock_imap.select.return_value = select_resp
-
-        store_resp = MagicMock()
-        store_resp.result = "OK"
-        mock_imap.store.return_value = store_resp
+        mock_imap = _mock_imap_connected()
         client._imap = mock_imap
 
         result = await client.mark_read(["1"], folder="INBOX", read=False)
         assert result.success is True
-        mock_imap.store.assert_called_with("1", "-FLAGS", "\\Seen")
+        mock_imap.uid.assert_called_with("store", "1", "-FLAGS", "(\\Seen)")
 
     @pytest.mark.asyncio
     async def test_move_email(self):
         client = IMAPClient(TEST_CONFIG)
-        mock_imap = AsyncMock()
-
-        noop_resp = MagicMock()
-        noop_resp.result = "OK"
-        mock_imap.noop.return_value = noop_resp
-
-        select_resp = MagicMock()
-        select_resp.result = "OK"
-        mock_imap.select.return_value = select_resp
-
-        copy_resp = MagicMock()
-        copy_resp.result = "OK"
-        mock_imap.copy.return_value = copy_resp
-
-        store_resp = MagicMock()
-        store_resp.result = "OK"
-        mock_imap.store.return_value = store_resp
-
-        expunge_resp = MagicMock()
-        expunge_resp.result = "OK"
-        mock_imap.expunge.return_value = expunge_resp
+        mock_imap = _mock_imap_connected()
         client._imap = mock_imap
 
         result = await client.move_email(["1"], "INBOX", "Archive")
         assert result.success is True
         assert result.moved_count == 1
-        mock_imap.copy.assert_called_with("1", "Archive")
+        mock_imap.uid.assert_any_call("copy", "1", "Archive")
+        mock_imap.uid.assert_any_call("store", "1", "+FLAGS", "(\\Deleted)")
 
     @pytest.mark.asyncio
     async def test_delete_email_to_trash(self):
         client = IMAPClient(TEST_CONFIG)
-        mock_imap = AsyncMock()
-
-        noop_resp = MagicMock()
-        noop_resp.result = "OK"
-        mock_imap.noop.return_value = noop_resp
-
-        select_resp = MagicMock()
-        select_resp.result = "OK"
-        mock_imap.select.return_value = select_resp
-
-        copy_resp = MagicMock()
-        copy_resp.result = "OK"
-        mock_imap.copy.return_value = copy_resp
-
-        store_resp = MagicMock()
-        store_resp.result = "OK"
-        mock_imap.store.return_value = store_resp
-
-        expunge_resp = MagicMock()
-        expunge_resp.result = "OK"
-        mock_imap.expunge.return_value = expunge_resp
+        mock_imap = _mock_imap_connected()
         client._imap = mock_imap
 
         result = await client.delete_email(["1"], folder="INBOX", permanent=False)
@@ -205,23 +149,7 @@ class TestIMAPClient:
     @pytest.mark.asyncio
     async def test_delete_email_permanent(self):
         client = IMAPClient(TEST_CONFIG)
-        mock_imap = AsyncMock()
-
-        noop_resp = MagicMock()
-        noop_resp.result = "OK"
-        mock_imap.noop.return_value = noop_resp
-
-        select_resp = MagicMock()
-        select_resp.result = "OK"
-        mock_imap.select.return_value = select_resp
-
-        store_resp = MagicMock()
-        store_resp.result = "OK"
-        mock_imap.store.return_value = store_resp
-
-        expunge_resp = MagicMock()
-        expunge_resp.result = "OK"
-        mock_imap.expunge.return_value = expunge_resp
+        mock_imap = _mock_imap_connected()
         client._imap = mock_imap
 
         result = await client.delete_email(["1", "2"], folder="INBOX", permanent=True)
