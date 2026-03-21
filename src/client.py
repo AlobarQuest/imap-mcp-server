@@ -11,6 +11,8 @@ from email.message import EmailMessage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import ssl
+
 import aioimaplib
 import aiosmtplib
 
@@ -36,10 +38,12 @@ class IMAPClient:
         self._imap: aioimaplib.IMAP4_SSL | None = None
 
     async def connect(self) -> None:
+        ssl_context = ssl.create_default_context()
         self._imap = aioimaplib.IMAP4_SSL(
             host=self.config.imap_host,
             port=self.config.imap_port,
             timeout=IMAP_TIMEOUT,
+            ssl_context=ssl_context,
         )
         await self._imap.wait_hello_from_server()
         await self._imap.login(self.config.username, self.config.password)
