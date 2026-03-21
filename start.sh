@@ -13,11 +13,15 @@ if [ -z "${BWS_ACCESS_TOKEN:-}" ]; then
 fi
 
 echo "Fetching secrets from BWS..." >&2
+echo "BWS_ACCESS_TOKEN length: ${#BWS_ACCESS_TOKEN}" >&2
+echo "bws path: $(which bws 2>/dev/null || echo 'NOT FOUND')" >&2
 
-BWS_JSON=$(bws secret list --output json 2>/dev/null) || {
-  echo "ERROR: bws secret list failed" >&2
+BWS_OUTPUT=$(bws secret list --output json 2>&1) || {
+  echo "ERROR: bws secret list failed with output:" >&2
+  echo "$BWS_OUTPUT" >&2
   exit 1
 }
+BWS_JSON="$BWS_OUTPUT"
 
 # Helper: extract a secret value by key name from the JSON array
 get_secret() {
