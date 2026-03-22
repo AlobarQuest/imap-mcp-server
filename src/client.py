@@ -117,7 +117,8 @@ class IMAPClient:
             return await self._list_folders_locked(imap)
 
     async def _list_folders_locked(self, imap: aioimaplib.IMAP4_SSL) -> list[str]:
-        response = await imap.list("", "*")
+        # Use "%" pattern — some servers (Namecheap) reject "*"
+        response = await imap.list('""', "%")
         if response.result != "OK":
             return []
         folders = []
@@ -126,10 +127,18 @@ class IMAPClient:
                 continue
             if isinstance(line, bytes):
                 line = line.decode("utf-8", errors="replace")
-            parts = line.rsplit('" ', 1)
+            # Parse LIST response formats:
+            #   (\flags) "/" "FolderName"   (quoted)
+            #   (\flags) "/" FolderName     (unquoted)
+            parts = line.split(') "', 1)
             if len(parts) == 2:
-                folder_name = parts[1].strip('"')
-                folders.append(folder_name)
+                remainder = parts[1]  # e.g: /" FolderName  or  /" "FolderName"
+                # Split on delimiter and take the folder name
+                delim_parts = remainder.split(" ", 1)
+                if len(delim_parts) == 2:
+                    folder_name = delim_parts[1].strip('"')
+                    if folder_name:
+                        folders.append(folder_name)
         return folders
 
     async def _search(self, imap: aioimaplib.IMAP4_SSL, criteria: str) -> list[str]:

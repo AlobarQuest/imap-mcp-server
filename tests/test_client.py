@@ -75,9 +75,9 @@ class TestIMAPClient:
         list_resp = MagicMock()
         list_resp.result = "OK"
         list_resp.lines = [
-            '(\\HasNoChildren) "/" "INBOX"',
-            '(\\HasNoChildren) "/" "Sent"',
-            '(\\HasNoChildren) "/" "Trash"',
+            b'(\\HasNoChildren) "/" INBOX',
+            b'(\\HasNoChildren \\Sent) "/" Sent',
+            b'(\\HasNoChildren \\Trash) "/" Trash',
         ]
         mock_imap.list.return_value = list_resp
         client._imap = mock_imap
