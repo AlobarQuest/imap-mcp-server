@@ -253,8 +253,12 @@ class TestToolsWithMockedClient:
             from src import server
             importlib.reload(server)
 
+            from src.errors import AuthenticationError
+
             mock_client = AsyncMock()
-            mock_client.list_emails.side_effect = Exception("Authentication failed")
+            mock_client.list_emails.side_effect = AuthenticationError(
+                "Authentication failed", account="testacct"
+            )
             server.imap_clients["testacct"] = mock_client
 
             result = await server.imap_list_emails(account="testacct")

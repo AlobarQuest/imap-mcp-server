@@ -72,16 +72,17 @@ class TestDiscoverAccounts:
             accounts = discover_accounts()
         assert len(accounts) == 0
 
-    def test_gap_in_numbering_stops_discovery(self):
-        """Account 1 exists, account 2 missing, account 3 exists — only finds 1."""
+    def test_gap_in_numbering_still_discovers(self):
+        """Account 1 exists, account 2 missing, account 3 exists — finds both."""
         env = _make_env([VALID_ACCOUNT])
-        # Add account 3 (skipping 2)
-        env["IMAP_ACCOUNT_3_NAME"] = "extra"
-        env["IMAP_ACCOUNT_3_EMAIL"] = "extra@example.com"
+        # Add account 3 (skipping 2) with full required fields
+        for key, value in VALID_ACCOUNT_2.items():
+            env[f"IMAP_ACCOUNT_3_{key.upper()}"] = value
         with patch.dict(os.environ, env, clear=True):
             accounts = discover_accounts()
-        assert len(accounts) == 1
-        assert "extra" not in accounts
+        assert len(accounts) == 2
+        assert "test" in accounts
+        assert "work" in accounts
 
     def test_default_ports(self):
         acct = {k: v for k, v in VALID_ACCOUNT.items() if k not in ("imap_port", "smtp_port")}
