@@ -92,6 +92,34 @@ class TestDiscoverAccounts:
         assert accounts["test"].imap_port == 993
         assert accounts["test"].smtp_port == 587
 
+    def test_default_smtp_security_and_trash(self):
+        env = _make_env([VALID_ACCOUNT])
+        with patch.dict(os.environ, env, clear=True):
+            accounts = discover_accounts()
+        assert accounts["test"].smtp_security == "starttls"
+        assert accounts["test"].trash_folder == "Trash"
+
+    def test_custom_smtp_security(self):
+        env = _make_env([VALID_ACCOUNT])
+        env["IMAP_ACCOUNT_1_SMTP_SECURITY"] = "ssl"
+        with patch.dict(os.environ, env, clear=True):
+            accounts = discover_accounts()
+        assert accounts["test"].smtp_security == "ssl"
+
+    def test_invalid_smtp_security_defaults_to_starttls(self):
+        env = _make_env([VALID_ACCOUNT])
+        env["IMAP_ACCOUNT_1_SMTP_SECURITY"] = "invalid"
+        with patch.dict(os.environ, env, clear=True):
+            accounts = discover_accounts()
+        assert accounts["test"].smtp_security == "starttls"
+
+    def test_custom_trash_folder(self):
+        env = _make_env([VALID_ACCOUNT])
+        env["IMAP_ACCOUNT_1_TRASH_FOLDER"] = "Deleted Items"
+        with patch.dict(os.environ, env, clear=True):
+            accounts = discover_accounts()
+        assert accounts["test"].trash_folder == "Deleted Items"
+
 
 class TestAccountRegistry:
     def test_empty_registry(self):

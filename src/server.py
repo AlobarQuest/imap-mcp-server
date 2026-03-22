@@ -81,8 +81,8 @@ async def imap_list_accounts() -> list[dict] | dict:
         status = "disconnected"
         if client:
             try:
-                connected = await client.is_connected()
-                status = "connected" if connected else "disconnected"
+                healthy = await client.check_health()
+                status = "connected" if healthy else "disconnected"
             except Exception:
                 status = "error"
         results.append({"name": config.name, "email": config.email, "status": status})
@@ -196,7 +196,6 @@ async def imap_send_email(
     body_html: str | None = None,
     cc: list[str] | None = None,
     bcc: list[str] | None = None,
-    reply_to_id: str | None = None,
 ) -> dict:
     """Send an email via SMTP.
 
@@ -208,26 +207,10 @@ async def imap_send_email(
         body_html: Optional HTML body
         cc: Optional CC recipients
         bcc: Optional BCC recipients
-        reply_to_id: Optional email UID to thread reply against
     """
     smtp = _get_smtp_client(account)
     if isinstance(smtp, dict):
         return smtp
-
-    # If replying, fetch the original message headers
-    in_reply_to = None
-    references = None
-    if reply_to_id:
-        imap = _get_imap_client(account)
-        if isinstance(imap, dict):
-            return imap
-        try:
-            original = await imap.read_email(uid=reply_to_id)
-            if original:
-                # We'd need message-id from headers; simplified for now
-                pass
-        except Exception:
-            pass
 
     try:
         result = await smtp.send_email(
@@ -237,9 +220,6 @@ async def imap_send_email(
             body_html=body_html,
             cc=cc,
             bcc=bcc,
-            reply_to_id=reply_to_id,
-            in_reply_to=in_reply_to,
-            references=references,
         )
         return result.model_dump()
     except IMAPError as exc:
@@ -270,6 +250,8 @@ async def imap_mark_read(
     try:
         result = await client.mark_read(uids=email_ids, folder=folder, read=read)
         return result.model_dump()
+    except IMAPError as exc:
+        return _error(exc.code, str(exc), account)
     except Exception as exc:
         return _error("CONNECTION_TIMEOUT", str(exc), account)
 
@@ -317,6 +299,8 @@ async def imap_list_folders(account: str) -> list[str] | dict:
 
     try:
         return await client.list_folders()
+    except IMAPError as exc:
+        return _error(exc.code, str(exc), account)
     except Exception as exc:
         return _error("CONNECTION_TIMEOUT", str(exc), account)
 
@@ -343,6 +327,8 @@ async def imap_delete_email(
     try:
         result = await client.delete_email(uids=email_ids, folder=folder, permanent=permanent)
         return result.model_dump()
+    except IMAPError as exc:
+        return _error(exc.code, str(exc), account)
     except Exception as exc:
         return _error("CONNECTION_TIMEOUT", str(exc), account)
 
@@ -350,16 +336,22 @@ async def imap_delete_email(
 # --- Health Endpoint ---
 
 
+async def _probe_accounts() -> dict[str, str]:
+    """Probe all accounts with check_health() and return status dict."""
+    statuses = {}
+    for name, client in imap_clients.items():
+        try:
+            healthy = await client.check_health()
+            statuses[name] = "connected" if healthy else "disconnected"
+        except Exception:
+            statuses[name] = "error"
+    return statuses
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request: Request) -> JSONResponse:
     """Combined health check — returns per-account status and overall readiness."""
-    accounts_status = {}
-    for name, client in imap_clients.items():
-        try:
-            connected = await client.is_connected()
-            accounts_status[name] = "connected" if connected else "disconnected"
-        except Exception:
-            accounts_status[name] = "error"
+    accounts_status = await _probe_accounts()
 
     any_connected = any(s == "connected" for s in accounts_status.values())
     if not accounts_status:
@@ -381,13 +373,7 @@ async def liveness(request: Request) -> JSONResponse:
 @mcp.custom_route("/health/ready", methods=["GET"])
 async def readiness(request: Request) -> JSONResponse:
     """Readiness probe — at least one account can authenticate."""
-    accounts_status = {}
-    for name, client in imap_clients.items():
-        try:
-            connected = await client.is_connected()
-            accounts_status[name] = "connected" if connected else "disconnected"
-        except Exception:
-            accounts_status[name] = "error"
+    accounts_status = await _probe_accounts()
 
     any_usable = any(s == "connected" for s in accounts_status.values())
     if not accounts_status:

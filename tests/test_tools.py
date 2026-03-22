@@ -264,3 +264,64 @@ class TestToolsWithMockedClient:
             result = await server.imap_list_emails(account="testacct")
             assert result["error"] is True
             assert result["code"] == "AUTH_FAILED"
+
+    @pytest.mark.asyncio
+    async def test_mark_read_folder_error(self):
+        with patch.dict(os.environ, _test_env(), clear=True):
+            import importlib
+            from src import server
+            importlib.reload(server)
+
+            from src.errors import FolderNotFoundError
+
+            mock_client = AsyncMock()
+            mock_client.mark_read.side_effect = FolderNotFoundError(
+                "Folder 'Bad' not found", account="testacct"
+            )
+            server.imap_clients["testacct"] = mock_client
+
+            result = await server.imap_mark_read(
+                account="testacct", email_ids=["1"], folder="Bad"
+            )
+            assert result["error"] is True
+            assert result["code"] == "FOLDER_NOT_FOUND"
+
+    @pytest.mark.asyncio
+    async def test_list_folders_typed_error(self):
+        with patch.dict(os.environ, _test_env(), clear=True):
+            import importlib
+            from src import server
+            importlib.reload(server)
+
+            from src.errors import AuthenticationError
+
+            mock_client = AsyncMock()
+            mock_client.list_folders.side_effect = AuthenticationError(
+                "Auth failed", account="testacct"
+            )
+            server.imap_clients["testacct"] = mock_client
+
+            result = await server.imap_list_folders(account="testacct")
+            assert result["error"] is True
+            assert result["code"] == "AUTH_FAILED"
+
+    @pytest.mark.asyncio
+    async def test_delete_email_folder_error(self):
+        with patch.dict(os.environ, _test_env(), clear=True):
+            import importlib
+            from src import server
+            importlib.reload(server)
+
+            from src.errors import FolderNotFoundError
+
+            mock_client = AsyncMock()
+            mock_client.delete_email.side_effect = FolderNotFoundError(
+                "Folder not found", account="testacct"
+            )
+            server.imap_clients["testacct"] = mock_client
+
+            result = await server.imap_delete_email(
+                account="testacct", email_ids=["1"]
+            )
+            assert result["error"] is True
+            assert result["code"] == "FOLDER_NOT_FOUND"

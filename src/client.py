@@ -96,6 +96,15 @@ class IMAPClient:
         except Exception:
             return False
 
+    async def check_health(self) -> bool:
+        """Check if account can connect and authenticate. Connects if needed."""
+        async with self._lock:
+            try:
+                await self._ensure_connected()
+                return True
+            except Exception:
+                return False
+
     async def _ensure_connected(self) -> aioimaplib.IMAP4_SSL:
         if not await self.is_connected():
             await self.connect()
@@ -278,7 +287,7 @@ class IMAPClient:
         imap = await self._ensure_connected()
         await self._select_folder(imap, folder)
 
-        response = await imap.uid("fetch", uid, "(FLAGS BODY[])")
+        response = await imap.uid("fetch", uid, "(FLAGS BODY.PEEK[])")
         if response.result != "OK":
             return None
 
@@ -461,7 +470,7 @@ class IMAPClient:
                     await imap.expunge()
                 return UpdateResult(success=count > 0, deleted_count=count)
             else:
-                result = await self._move_email_locked(uids, folder, "Trash")
+                result = await self._move_email_locked(uids, folder, self.config.trash_folder)
                 return UpdateResult(success=result.success, deleted_count=result.moved_count)
 
 
@@ -479,9 +488,6 @@ class SMTPClient:
         body_html: str | None = None,
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
-        reply_to_id: str | None = None,
-        in_reply_to: str | None = None,
-        references: str | None = None,
     ) -> SendResult:
         if body_html:
             msg = MIMEMultipart("alternative")
@@ -490,15 +496,15 @@ class SMTPClient:
         else:
             msg = MIMEText(body, "plain")
 
+        # Generate Message-ID before sending
+        domain = self.config.email.split("@")[1] if "@" in self.config.email else "localhost"
+        msg["Message-ID"] = email.utils.make_msgid(domain=domain)
         msg["From"] = self.config.email
         msg["To"] = ", ".join(to)
         msg["Subject"] = subject
 
         if cc:
             msg["Cc"] = ", ".join(cc)
-        if in_reply_to:
-            msg["In-Reply-To"] = in_reply_to
-            msg["References"] = references or in_reply_to
 
         all_recipients = list(to)
         if cc:
@@ -506,15 +512,18 @@ class SMTPClient:
         if bcc:
             all_recipients.extend(bcc)
 
-        await aiosmtplib.send(
-            msg,
-            hostname=self.config.smtp_host,
-            port=self.config.smtp_port,
-            username=self.config.username,
-            password=self.config.password,
-            start_tls=True,
-            recipients=all_recipients,
-        )
+        smtp_kwargs: dict = {
+            "hostname": self.config.smtp_host,
+            "port": self.config.smtp_port,
+            "username": self.config.username,
+            "password": self.config.password,
+            "recipients": all_recipients,
+        }
+        if self.config.smtp_security == "ssl":
+            smtp_kwargs["use_tls"] = True
+        else:
+            smtp_kwargs["start_tls"] = True
 
-        message_id = msg.get("Message-ID", "")
-        return SendResult(success=True, message_id=message_id)
+        await aiosmtplib.send(msg, **smtp_kwargs)
+
+        return SendResult(success=True, message_id=msg["Message-ID"])
