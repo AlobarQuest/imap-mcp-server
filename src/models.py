@@ -14,8 +14,10 @@ class AccountConfig(BaseModel):
     imap_port: int = 993
     smtp_host: str
     smtp_port: int = 587
+    smtp_security: str = "starttls"  # "starttls" (port 587) or "ssl" (port 465)
     username: str
     password: str
+    trash_folder: str = "Trash"
 
 
 class AccountInfo(BaseModel):

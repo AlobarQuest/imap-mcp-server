@@ -10,7 +10,21 @@ from .models import AccountConfig
 logger = logging.getLogger(__name__)
 
 REQUIRED_FIELDS = ("NAME", "EMAIL", "IMAP_HOST", "SMTP_HOST", "USERNAME", "PASSWORD")
-OPTIONAL_DEFAULTS = {"IMAP_PORT": "993", "SMTP_PORT": "587"}
+OPTIONAL_DEFAULTS = {"IMAP_PORT": "993", "SMTP_PORT": "587", "SMTP_SECURITY": "starttls", "TRASH_FOLDER": "Trash"}
+VALID_SMTP_SECURITY = ("starttls", "ssl")
+
+
+def _validated_smtp_security(value: str, index: int) -> str:
+    """Validate smtp_security value, defaulting to starttls if invalid."""
+    value = value.lower().strip()
+    if value not in VALID_SMTP_SECURITY:
+        logger.warning(
+            "Account index %d: invalid SMTP_SECURITY '%s', defaulting to 'starttls'",
+            index,
+            value,
+        )
+        return "starttls"
+    return value
 
 
 def _find_account_indices() -> list[int]:
@@ -62,8 +76,13 @@ def discover_accounts() -> dict[str, AccountConfig]:
                 smtp_port=int(
                     os.environ.get(f"{prefix}SMTP_PORT", OPTIONAL_DEFAULTS["SMTP_PORT"])
                 ),
+                smtp_security=_validated_smtp_security(
+                    os.environ.get(f"{prefix}SMTP_SECURITY", OPTIONAL_DEFAULTS["SMTP_SECURITY"]),
+                    index,
+                ),
                 username=os.environ[f"{prefix}USERNAME"],
                 password=os.environ[f"{prefix}PASSWORD"],
+                trash_folder=os.environ.get(f"{prefix}TRASH_FOLDER", OPTIONAL_DEFAULTS["TRASH_FOLDER"]),
             )
             accounts[name] = config
             logger.info("Registered account: %s (%s)", name, config.email)
