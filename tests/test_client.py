@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.client import IMAPClient, SMTPClient
+from src.client import IMAPClient, SMTPClient, _escape_imap_string
 from src.models import AccountConfig
 
 TEST_CONFIG = AccountConfig(
@@ -155,6 +155,26 @@ class TestIMAPClient:
         result = await client.delete_email(["1", "2"], folder="INBOX", permanent=True)
         assert result.success is True
         assert result.deleted_count == 2
+
+
+class TestIMAPEscaping:
+    def test_normal_string(self):
+        assert _escape_imap_string("hello world") == "hello world"
+
+    def test_removes_quotes(self):
+        assert _escape_imap_string('test "quoted" string') == "test quoted string"
+
+    def test_removes_backslashes(self):
+        assert _escape_imap_string("test\\value") == "testvalue"
+
+    def test_removes_newlines(self):
+        assert _escape_imap_string("line1\nline2\rline3") == "line1line2line3"
+
+    def test_mixed_dangerous_chars(self):
+        assert _escape_imap_string('a"b\\c\nd') == "abcd"
+
+    def test_empty_string(self):
+        assert _escape_imap_string("") == ""
 
 
 class TestSMTPClient:

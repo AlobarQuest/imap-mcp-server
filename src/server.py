@@ -12,6 +12,7 @@ from starlette.responses import JSONResponse
 
 from .accounts import AccountRegistry
 from .client import IMAPClient, SMTPClient
+from .errors import IMAPError
 from .models import ErrorResponse
 
 load_dotenv()
@@ -124,9 +125,10 @@ async def imap_list_emails(
             search=search,
         )
         return [e.model_dump(by_alias=True) for e in emails]
+    except IMAPError as exc:
+        return _error(exc.code, str(exc), account)
     except Exception as exc:
-        code = "AUTH_FAILED" if "auth" in str(exc).lower() else "CONNECTION_TIMEOUT"
-        return _error(code, str(exc), account)
+        return _error("CONNECTION_TIMEOUT", str(exc), account)
 
 
 @mcp.tool()
@@ -151,9 +153,10 @@ async def imap_read_email(
         if detail is None:
             return _error("EMAIL_NOT_FOUND", f"Email {email_id} not found in {folder}", account)
         return detail.model_dump(by_alias=True)
+    except IMAPError as exc:
+        return _error(exc.code, str(exc), account)
     except Exception as exc:
-        code = "AUTH_FAILED" if "auth" in str(exc).lower() else "CONNECTION_TIMEOUT"
-        return _error(code, str(exc), account)
+        return _error("CONNECTION_TIMEOUT", str(exc), account)
 
 
 @mcp.tool()
@@ -178,9 +181,10 @@ async def imap_search_emails(
     try:
         results = await client.search_emails(query=query, folder=folder, limit=limit)
         return [e.model_dump(by_alias=True) for e in results]
+    except IMAPError as exc:
+        return _error(exc.code, str(exc), account)
     except Exception as exc:
-        code = "AUTH_FAILED" if "auth" in str(exc).lower() else "CONNECTION_TIMEOUT"
-        return _error(code, str(exc), account)
+        return _error("CONNECTION_TIMEOUT", str(exc), account)
 
 
 @mcp.tool()
@@ -238,9 +242,10 @@ async def imap_send_email(
             references=references,
         )
         return result.model_dump()
+    except IMAPError as exc:
+        return _error(exc.code, str(exc), account)
     except Exception as exc:
-        code = "AUTH_FAILED" if "auth" in str(exc).lower() else "SEND_FAILED"
-        return _error(code, str(exc), account)
+        return _error("SEND_FAILED", str(exc), account)
 
 
 @mcp.tool()
@@ -293,9 +298,9 @@ async def imap_move_email(
             uids=email_ids, from_folder=from_folder, to_folder=to_folder
         )
         return result.model_dump()
+    except IMAPError as exc:
+        return _error(exc.code, str(exc), account)
     except Exception as exc:
-        if "folder" in str(exc).lower():
-            return _error("FOLDER_NOT_FOUND", str(exc), account)
         return _error("CONNECTION_TIMEOUT", str(exc), account)
 
 
@@ -347,7 +352,7 @@ async def imap_delete_email(
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request: Request) -> JSONResponse:
-    """Health check endpoint showing per-account connection status."""
+    """Combined health check — returns per-account status and overall readiness."""
     accounts_status = {}
     for name, client in imap_clients.items():
         try:
@@ -356,8 +361,49 @@ async def health_check(request: Request) -> JSONResponse:
         except Exception:
             accounts_status[name] = "error"
 
-    overall = "ok" if accounts_status else "no_accounts"
+    any_connected = any(s == "connected" for s in accounts_status.values())
+    if not accounts_status:
+        overall = "no_accounts"
+    elif any_connected:
+        overall = "ok"
+    else:
+        overall = "degraded"
+
     return JSONResponse({"status": overall, "accounts": accounts_status})
+
+
+@mcp.custom_route("/health/live", methods=["GET"])
+async def liveness(request: Request) -> JSONResponse:
+    """Liveness probe — process is up."""
+    return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/health/ready", methods=["GET"])
+async def readiness(request: Request) -> JSONResponse:
+    """Readiness probe — at least one account can authenticate."""
+    accounts_status = {}
+    for name, client in imap_clients.items():
+        try:
+            connected = await client.is_connected()
+            accounts_status[name] = "connected" if connected else "disconnected"
+        except Exception:
+            accounts_status[name] = "error"
+
+    any_usable = any(s == "connected" for s in accounts_status.values())
+    if not accounts_status:
+        status_code = 503
+        overall = "no_accounts"
+    elif any_usable:
+        status_code = 200
+        overall = "ready"
+    else:
+        status_code = 503
+        overall = "not_ready"
+
+    return JSONResponse(
+        {"status": overall, "accounts": accounts_status},
+        status_code=status_code,
+    )
 
 
 def create_app():

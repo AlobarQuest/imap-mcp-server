@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import email
 import email.policy
 import email.utils
@@ -15,6 +16,13 @@ from email.mime.text import MIMEText
 import aioimaplib
 import aiosmtplib
 
+from .errors import (
+    AuthenticationError,
+    ConnectionError,
+    EmailNotFoundError,
+    FolderNotFoundError,
+    SendError,
+)
 from .models import (
     AccountConfig,
     Attachment,
@@ -27,9 +35,19 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 IMAP_TIMEOUT = 30
+PREVIEW_BYTES = 512  # Max bytes to fetch for email preview
 
 # Regex to extract UID from FETCH response line like "1 FETCH (UID 42 FLAGS ...)"
 UID_RE = re.compile(r"UID\s+(\d+)")
+
+
+def _escape_imap_string(s: str) -> str:
+    """Escape a string for use in IMAP search commands.
+
+    Removes characters that could break IMAP protocol commands.
+    """
+    # Remove backslashes and double quotes which break IMAP search syntax
+    return s.replace("\\", "").replace('"', "").replace("\r", "").replace("\n", "")
 
 
 class IMAPClient:
@@ -43,6 +61,7 @@ class IMAPClient:
     def __init__(self, config: AccountConfig) -> None:
         self.config = config
         self._imap: aioimaplib.IMAP4_SSL | None = None
+        self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
         ssl_context = ssl.create_default_context()
@@ -55,7 +74,10 @@ class IMAPClient:
         await self._imap.wait_hello_from_server()
         response = await self._imap.login(self.config.username, self.config.password)
         if response.result != "OK":
-            raise Exception(f"Authentication failed for {self.config.username}")
+            raise AuthenticationError(
+                f"Authentication failed for {self.config.username}",
+                account=self.config.name,
+            )
 
     async def disconnect(self) -> None:
         if self._imap:
@@ -80,8 +102,21 @@ class IMAPClient:
         assert self._imap is not None
         return self._imap
 
+    async def _select_folder(self, imap: aioimaplib.IMAP4_SSL, folder: str) -> None:
+        """Select a folder, raising FolderNotFoundError on failure."""
+        response = await imap.select(folder)
+        if response.result != "OK":
+            raise FolderNotFoundError(
+                f"Folder '{folder}' not found or not selectable",
+                account=self.config.name,
+            )
+
     async def list_folders(self) -> list[str]:
-        imap = await self._ensure_connected()
+        async with self._lock:
+            imap = await self._ensure_connected()
+            return await self._list_folders_locked(imap)
+
+    async def _list_folders_locked(self, imap: aioimaplib.IMAP4_SSL) -> list[str]:
         response = await imap.list("", "*")
         if response.result != "OK":
             return []
@@ -139,71 +174,62 @@ class IMAPClient:
         since_date: str | None = None,
         search: str | None = None,
     ) -> list[EmailSummary]:
-        imap = await self._ensure_connected()
-        await imap.select(folder)
+        async with self._lock:
+            imap = await self._ensure_connected()
+            await self._select_folder(imap, folder)
 
-        # Build IMAP search criteria
-        criteria = []
-        if unread_only:
-            criteria.append("UNSEEN")
-        if since_date:
-            try:
-                dt = datetime.fromisoformat(since_date)
-                criteria.append(f'SINCE {dt.strftime("%d-%b-%Y")}')
-            except ValueError:
-                pass
-        if search:
-            criteria.append(f'OR SUBJECT "{search}" FROM "{search}"')
-        if not criteria:
-            criteria.append("ALL")
+            # Build IMAP search criteria
+            criteria = []
+            if unread_only:
+                criteria.append("UNSEEN")
+            if since_date:
+                try:
+                    dt = datetime.fromisoformat(since_date)
+                    criteria.append(f'SINCE {dt.strftime("%d-%b-%Y")}')
+                except ValueError:
+                    pass
+            if search:
+                safe = _escape_imap_string(search)
+                criteria.append(f'OR SUBJECT "{safe}" FROM "{safe}"')
+            if not criteria:
+                criteria.append("ALL")
 
-        search_str = " ".join(criteria)
-        seqs = await self._search(imap, search_str)
+            search_str = " ".join(criteria)
+            seqs = await self._search(imap, search_str)
 
-        # Reverse for newest first, apply pagination
-        seqs = list(reversed(seqs))
-        seqs = seqs[offset : offset + limit]
+            # Reverse for newest first, apply pagination
+            seqs = list(reversed(seqs))
+            seqs = seqs[offset : offset + limit]
 
-        # Convert to UIDs
-        uids = await self._seq_to_uids(imap, seqs)
+            # Convert to UIDs
+            uids = await self._seq_to_uids(imap, seqs)
 
-        results = []
-        for uid in uids:
-            summary = await self._fetch_summary(imap, uid)
-            if summary:
-                results.append(summary)
-        return results
+            results = []
+            for uid in uids:
+                summary = await self._fetch_summary(imap, uid)
+                if summary:
+                    results.append(summary)
+            return results
 
     async def _fetch_summary(
         self, imap: aioimaplib.IMAP4_SSL, uid: str
     ) -> EmailSummary | None:
-        response = await imap.uid("fetch", uid, "(FLAGS BODY.PEEK[HEADER] BODY.PEEK[TEXT])")
+        # Fetch only flags and headers — no body, for performance
+        response = await imap.uid("fetch", uid, "(FLAGS BODY.PEEK[HEADER])")
         if response.result != "OK":
             return None
 
-        # aioimaplib response structure:
-        # line[0]: bytes - metadata "N FETCH (UID X FLAGS (...) BODY[HEADER] {size})"
-        # line[1]: str/bytearray - actual header content
-        # line[2]: bytes - " BODY[TEXT] {size}"
-        # line[3]: str/bytearray - actual body content
-        # line[4]: bytes - ")"
-        # line[5]: bytes - "Fetch completed..."
         flags_str = ""
         header_data = b""
-        body_text_raw = ""
 
-        for i, line in enumerate(response.lines):
+        for line in response.lines:
             if isinstance(line, bytes):
                 decoded = line.decode("utf-8", errors="replace")
                 if "FLAGS" in decoded:
                     flags_str = decoded
             elif isinstance(line, (str, bytearray)):
-                # Content lines — first one is header, second is body
-                line_bytes = bytes(line, "utf-8") if isinstance(line, str) else bytes(line)
                 if not header_data:
-                    header_data = line_bytes
-                else:
-                    body_text_raw = line if isinstance(line, str) else line.decode("utf-8", errors="replace")
+                    header_data = bytes(line, "utf-8") if isinstance(line, str) else bytes(line)
 
         if not header_data:
             return None
@@ -218,13 +244,12 @@ class IMAPClient:
         sender = str(msg.get("From", ""))
         date_str = str(msg.get("Date", ""))
 
-        # Preview from body text
-        preview = body_text_raw[:200].replace("\n", " ").replace("\r", " ").strip()
-        if len(body_text_raw) > 200:
-            preview += "..."
+        # Use Subject as preview since we don't fetch body for listings
+        preview = subject[:200]
 
-        # Can't determine attachments from header-only fetch
-        has_attachments = False
+        # Check Content-Type header for multipart/mixed as attachment hint
+        content_type = str(msg.get("Content-Type", ""))
+        has_attachments = "multipart/mixed" in content_type.lower()
 
         return EmailSummary(
             id=uid,
@@ -237,8 +262,12 @@ class IMAPClient:
         )
 
     async def read_email(self, uid: str, folder: str = "INBOX") -> EmailDetail | None:
+        async with self._lock:
+            return await self._read_email_locked(uid, folder)
+
+    async def _read_email_locked(self, uid: str, folder: str) -> EmailDetail | None:
         imap = await self._ensure_connected()
-        await imap.select(folder)
+        await self._select_folder(imap, folder)
 
         response = await imap.uid("fetch", uid, "(FLAGS BODY[])")
         if response.result != "OK":
@@ -321,36 +350,38 @@ class IMAPClient:
     async def search_emails(
         self, query: str, folder: str = "INBOX", limit: int = 20
     ) -> list[EmailSummary]:
-        imap = await self._ensure_connected()
+        async with self._lock:
+            imap = await self._ensure_connected()
 
-        if folder == "ALL":
-            folders = await self.list_folders()
-        else:
-            folders = [folder]
+            if folder == "ALL":
+                folders = await self._list_folders_locked(imap)
+            else:
+                folders = [folder]
 
-        results: list[EmailSummary] = []
-        for f in folders:
-            if len(results) >= limit:
-                break
-            try:
-                await imap.select(f)
-                search_criteria = (
-                    f'OR (OR SUBJECT "{query}" FROM "{query}") '
-                    f'(OR TO "{query}" BODY "{query}")'
-                )
-                seqs = await self._search(imap, search_criteria)
-                seqs = list(reversed(seqs))
-                uids = await self._seq_to_uids(imap, seqs[: limit - len(results)])
+            results: list[EmailSummary] = []
+            for f in folders:
+                if len(results) >= limit:
+                    break
+                try:
+                    await self._select_folder(imap, f)
+                    safe = _escape_imap_string(query)
+                    search_criteria = (
+                        f'OR (OR SUBJECT "{safe}" FROM "{safe}") '
+                        f'(OR TO "{safe}" BODY "{safe}")'
+                    )
+                    seqs = await self._search(imap, search_criteria)
+                    seqs = list(reversed(seqs))
+                    uids = await self._seq_to_uids(imap, seqs[: limit - len(results)])
 
-                for uid in uids:
-                    summary = await self._fetch_summary(imap, uid)
-                    if summary:
-                        results.append(summary)
-            except Exception:
-                logger.warning("Search failed in folder %s", f)
-                continue
+                    for uid in uids:
+                        summary = await self._fetch_summary(imap, uid)
+                        if summary:
+                            results.append(summary)
+                except Exception:
+                    logger.warning("Search failed in folder %s", f)
+                    continue
 
-        return results[:limit]
+            return results[:limit]
 
     async def mark_read(
         self,
@@ -358,17 +389,18 @@ class IMAPClient:
         folder: str = "INBOX",
         read: bool = True,
     ) -> UpdateResult:
-        imap = await self._ensure_connected()
-        await imap.select(folder)
+        async with self._lock:
+            imap = await self._ensure_connected()
+            await self._select_folder(imap, folder)
 
-        count = 0
-        for uid in uids:
-            flag_op = "+FLAGS" if read else "-FLAGS"
-            response = await imap.uid("store", uid, flag_op, "(\\Seen)")
-            if response.result == "OK":
-                count += 1
+            count = 0
+            for uid in uids:
+                flag_op = "+FLAGS" if read else "-FLAGS"
+                response = await imap.uid("store", uid, flag_op, "(\\Seen)")
+                if response.result == "OK":
+                    count += 1
 
-        return UpdateResult(success=count > 0, updated_count=count)
+            return UpdateResult(success=count > 0, updated_count=count)
 
     async def move_email(
         self,
@@ -376,8 +408,17 @@ class IMAPClient:
         from_folder: str,
         to_folder: str,
     ) -> UpdateResult:
+        async with self._lock:
+            return await self._move_email_locked(uids, from_folder, to_folder)
+
+    async def _move_email_locked(
+        self,
+        uids: list[str],
+        from_folder: str,
+        to_folder: str,
+    ) -> UpdateResult:
         imap = await self._ensure_connected()
-        await imap.select(from_folder)
+        await self._select_folder(imap, from_folder)
 
         count = 0
         for uid in uids:
@@ -397,21 +438,22 @@ class IMAPClient:
         folder: str = "INBOX",
         permanent: bool = False,
     ) -> UpdateResult:
-        imap = await self._ensure_connected()
-        await imap.select(folder)
+        async with self._lock:
+            imap = await self._ensure_connected()
+            await self._select_folder(imap, folder)
 
-        if permanent:
-            count = 0
-            for uid in uids:
-                response = await imap.uid("store", uid, "+FLAGS", "(\\Deleted)")
-                if response.result == "OK":
-                    count += 1
-            if count > 0:
-                await imap.expunge()
-            return UpdateResult(success=count > 0, deleted_count=count)
-        else:
-            result = await self.move_email(uids, folder, "Trash")
-            return UpdateResult(success=result.success, deleted_count=result.moved_count)
+            if permanent:
+                count = 0
+                for uid in uids:
+                    response = await imap.uid("store", uid, "+FLAGS", "(\\Deleted)")
+                    if response.result == "OK":
+                        count += 1
+                if count > 0:
+                    await imap.expunge()
+                return UpdateResult(success=count > 0, deleted_count=count)
+            else:
+                result = await self._move_email_locked(uids, folder, "Trash")
+                return UpdateResult(success=result.success, deleted_count=result.moved_count)
 
 
 class SMTPClient:

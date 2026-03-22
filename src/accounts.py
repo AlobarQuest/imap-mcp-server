@@ -13,16 +13,32 @@ REQUIRED_FIELDS = ("NAME", "EMAIL", "IMAP_HOST", "SMTP_HOST", "USERNAME", "PASSW
 OPTIONAL_DEFAULTS = {"IMAP_PORT": "993", "SMTP_PORT": "587"}
 
 
-def discover_accounts() -> dict[str, AccountConfig]:
-    """Scan env vars for IMAP_ACCOUNT_N_* patterns and return a registry keyed by name."""
-    accounts: dict[str, AccountConfig] = {}
-    index = 1
+def _find_account_indices() -> list[int]:
+    """Scan environment for all IMAP_ACCOUNT_N_NAME keys and return sorted indices."""
+    indices = []
+    for key in os.environ:
+        if key.startswith("IMAP_ACCOUNT_") and key.endswith("_NAME"):
+            middle = key[len("IMAP_ACCOUNT_"):-len("_NAME")]
+            try:
+                indices.append(int(middle))
+            except ValueError:
+                continue
+    return sorted(indices)
 
-    while True:
+
+def discover_accounts() -> dict[str, AccountConfig]:
+    """Scan env vars for all IMAP_ACCOUNT_N_* patterns and return a registry keyed by name.
+
+    Scans all matching prefixes found in the environment rather than stopping
+    at the first numbering gap.
+    """
+    accounts: dict[str, AccountConfig] = {}
+
+    for index in _find_account_indices():
         prefix = f"IMAP_ACCOUNT_{index}_"
         name = os.environ.get(f"{prefix}NAME")
         if name is None:
-            break
+            continue
 
         missing = [f for f in REQUIRED_FIELDS if not os.environ.get(f"{prefix}{f}")]
         if missing:
@@ -32,7 +48,6 @@ def discover_accounts() -> dict[str, AccountConfig]:
                 index,
                 ", ".join(missing),
             )
-            index += 1
             continue
 
         try:
@@ -54,8 +69,6 @@ def discover_accounts() -> dict[str, AccountConfig]:
             logger.info("Registered account: %s (%s)", name, config.email)
         except Exception:
             logger.warning("Skipping account index %d: invalid configuration", index)
-
-        index += 1
 
     logger.info("Discovered %d account(s)", len(accounts))
     return accounts
